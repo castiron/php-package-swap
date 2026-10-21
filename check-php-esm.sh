@@ -11,7 +11,7 @@
 #
 # Usage: ./check-php-esm.sh
 
-set -uo pipefail
+set -u
 
 FAILS=0
 line() {  # line PASS|FAIL "label" "detail"
@@ -63,7 +63,7 @@ if [[ -z $PRO ]]; then
   line FAIL "$LABEL2" "Ubuntu Pro client not installed"
 elif [[ $ESM_ON != *esm-infra* ]]; then
   line FAIL "$LABEL2" "esm-infra is not enabled (attach with: pro attach <token>)"
-elif ! apt-cache policy 2>/dev/null | grep -q 'esm.ubuntu.com/infra'; then
+elif [[ $(apt-cache policy 2>/dev/null) != *esm.ubuntu.com/infra* ]]; then
   line FAIL "$LABEL2" "esm-infra enabled but its apt source is missing (run: apt-get update)"
 else
   line PASS "$LABEL2" "${ESM_ON// /, }"
@@ -78,7 +78,7 @@ ORIGINS=$(grep -E '^Unattended-Upgrade::(Allowed-Origins|Origins-Pattern)::' <<<
           grep -h 'Allowed origins are:' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -1)
 LAST=$(grep -h 'Starting unattended upgrades script' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null \
          | tail -1 | cut -c1-16)
-if ! dpkg-query -W -f='${db:Status-Abbrev}' unattended-upgrades 2>/dev/null | grep -q '^ii'; then
+if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' unattended-upgrades 2>/dev/null) != ii* ]]; then
   line FAIL "$LABEL3" "unattended-upgrades is not installed"
 elif ! grep -q '^APT::Periodic::Unattended-Upgrade "1"' <<<"$APTCFG"; then
   line FAIL "$LABEL3" "turned off (APT::Periodic::Unattended-Upgrade is not \"1\")"
