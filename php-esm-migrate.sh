@@ -233,20 +233,32 @@ ok "$PRETTY_NAME (Ubuntu's own PHP for this release is $PHPV)"
 mapfile -t FPM_VERS < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'php*-fpm' 2>/dev/null \
                           | awk '$1=="ii" {print $2}' | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm$/\1/p')
 (( ${#FPM_VERS[@]} )) || die "No phpX.Y-fpm package is installed."
+# Prefer the PHP-FPM that is actually running: that's what serves the site.
+ACTIVE_VERS=()
 for v in "${FPM_VERS[@]}"; do
+  if systemctl is-active --quiet "php$v-fpm" 2>/dev/null; then ACTIVE_VERS+=("$v"); fi
+done
+CANDIDATES=("${FPM_VERS[@]}")
+if (( ${#ACTIVE_VERS[@]} )); then
+  CANDIDATES=("${ACTIVE_VERS[@]}")
+  ok "PHP-FPM running: ${ACTIVE_VERS[*]} (installed: ${FPM_VERS[*]})"
+else
+  warn "No PHP-FPM service is running (installed: ${FPM_VERS[*]})"
+fi
+for v in "${CANDIDATES[@]}"; do
   if [[ $v == "$PHPV" ]]; then FPMV=$v; fi
 done
 if [[ -z $FPMV ]]; then
-  if (( ${#FPM_VERS[@]} > 1 )); then
-    die "Several PHP-FPM versions are installed (${FPM_VERS[*]}) and none is $PHPV; handle this host manually."
+  if (( ${#CANDIDATES[@]} > 1 )); then
+    die "Several PHP-FPM versions are ${ACTIVE_VERS[*]:+running}${ACTIVE_VERS[*]:-installed} (${CANDIDATES[*]}) and none is Ubuntu's $PHPV; handle this host manually."
   fi
-  FPMV=${FPM_VERS[0]}
+  FPMV=${CANDIDATES[0]}
   if (( DO_MIGRATE )); then
     die "This host runs PHP-FPM $FPMV, but Ubuntu $VERSION_ID only packages PHP $PHPV, so leaving the PPA means upgrading PHP, which this script doesn't do. Rerun with --skip-migrate to apply the config mitigations only."
   fi
   warn "PHP-FPM $FPMV is not Ubuntu's PHP for this release: config mitigations only, and no fix will come from Ubuntu for it."
-elif (( ${#FPM_VERS[@]} > 1 )); then
-  warn "Other PHP-FPM versions are installed too (${FPM_VERS[*]}); only PHP $FPMV is handled."
+elif (( ${#CANDIDATES[@]} > 1 )); then
+  warn "Other PHP-FPM versions are running too (${CANDIDATES[*]}); only PHP $FPMV is handled."
 fi
 FPM_BIN=php-fpm$FPMV FPM_SVC=php$FPMV-fpm ETC_PHP=/etc/php/$FPMV POOL_DIR=/etc/php/$FPMV/fpm/pool.d
 command -v "$FPM_BIN" >/dev/null || die "$FPM_BIN binary not found."
@@ -539,7 +551,7 @@ else
     done
     if (( ${#PROBLEMS[@]} )); then
       if (( APPLY )); then restore_ppa; fi
-      die "No Ubuntu replacement for: ${PROBLEMS[*]}. These belong to a PHP version that's in use, or have no Ubuntu package; handle them manually, then rerun."
+      die "No Ubuntu replacement for: ${PROBLEMS[*]}. If that PHP version isn't used, purge it (e.g. apt-get purge 'php7.3*') and rerun; otherwise handle this host manually."
     fi
 
     APT_OPTS=(-y -q --allow-downgrades -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
