@@ -6,26 +6,29 @@
 # PHP-FPM from the ondrej/php PPA (deb.sury.org):
 #     Ubuntu 18.04 + PHP 7.2      Ubuntu 20.04 + PHP 7.4
 #
-#   1. Disables the Puppet agent (and waits out any run in progress) so nothing
-#      reverts these changes mid-flight.
-#   2. Backs up /etc/php/<version>, apt sources, and repacks the installed PPA packages as .debs.
-#   3. Applies the interim FPM config mitigations from the PHP advisories.
-#   4. Moves every PPA package to Ubuntu's ESM-maintained build of the same PHP version,
-#      so Canonical's fix arrives through `apt upgrade`. PPA packages for another PHP
-#      version that has no CLI/FPM installed (e.g. php8.2-common pulled in by the PPA's
-#      php-mysql metapackage) are removed; they can't be run anyway.
-#   5. Verifies the result.
+# Every check runs first and changes nothing. If anything would stop the run, the
+# script lists all the problems (with what to do about each) and exits before
+# touching the host. Only then, with --apply, does it:
 #
-# A host whose PHP-FPM isn't the PHP Ubuntu ships for that release (e.g. PHP 7.3 on
-# 20.04) can't be migrated by this script, because that's a PHP upgrade. Run it with
-# --skip-migrate to apply the config mitigations only.
+#   1. Disable the Puppet agent (and wait out any run in progress).
+#   2. Back up /etc/php/<version> and apt sources, and repack the PPA packages as .debs.
+#   3. Apply the FPM config mitigations from the PHP advisories.
+#   4. Move every PPA package to Ubuntu's ESM build of the same PHP version, so
+#      Canonical's fix arrives through apt. PPA packages for another PHP version
+#      that has no CLI/FPM installed (e.g. php8.2-common pulled in by the PPA's
+#      php-mysql metapackage) are removed; nothing can run them anyway.
+#   5. Verify the result.
+#
+# A host whose running PHP-FPM isn't the PHP Ubuntu ships for that release (e.g. the
+# PPA's 7.4 on 18.04) can't be migrated: the site must first be switched to Ubuntu's
+# PHP version. --skip-migrate applies the config mitigations only.
 #
 # Usage:
-#   sudo ./php-esm-migrate.sh            # dry run: checks and shows the plan, changes nothing
+#   sudo ./php-esm-migrate.sh            # check + show the plan, change nothing
 #   sudo ./php-esm-migrate.sh --apply    # do it
 #
 # Options:
-#   --apply            make changes (default is a dry run)
+#   --apply            make changes (default only checks and shows the plan)
 #   --yes              skip confirmation prompts (with --apply)
 #   --post-max SIZE    upper bound for post_max_size (default 32M; never raises the current value)
 #   --memcap SIZE      systemd MemoryLimit for PHP-FPM (default: 75% of RAM)
@@ -67,14 +70,15 @@ WORKDIR=/root/php-esm-migrate-$TS
 mkdir -p "$WORKDIR/new"
 exec > >(tee -a "$WORKDIR/run.log") 2>&1
 
-WARNINGS=() INSTALL=() REMOVE=() REMOVE_ARGS=() LEFTOVER=() PROBLEMS=() PPA_LISTS=() PPA_SAVES=()
-SL_HIT=0 PHPV="" FPMV="" FPM_BIN="" FPM_SVC="" ETC_PHP="" POOL_DIR=""
+WARNINGS=() PROBLEMS=() INSTALL=() REMOVE=() REMOVE_ARGS=() LEFTOVER=() PPA_LISTS=() PPA_SAVES=()
+SL_HIT=0 PHPV="" FIXED="" FPMV="" FPM_BIN="" FPM_SVC="" ETC_PHP="" POOL_DIR="" PUPPET="" LOCK=""
 c_b=$'\e[1;34m' c_g=$'\e[32m' c_y=$'\e[33m' c_r=$'\e[1;31m' c_0=$'\e[0m'
-step() { printf '\n%s==> %s%s\n' "$c_b" "$*" "$c_0"; }
-ok()   { printf '    %sOK%s    %s\n' "$c_g" "$c_0" "$*"; }
-note() { printf '    %s\n' "$*"; }
-warn() { printf '    %sWARN%s  %s\n' "$c_y" "$c_0" "$*"; WARNINGS+=("$*"); }
-die()  { printf '\n%sABORT:%s %s\n' "$c_r" "$c_0" "$*"; printf 'Log and backups: %s\n' "$WORKDIR"; exit 1; }
+step()    { printf '\n%s==> %s%s\n' "$c_b" "$*" "$c_0"; }
+ok()      { printf '    %sOK%s    %s\n' "$c_g" "$c_0" "$*"; }
+note()    { printf '    %s\n' "$*"; }
+warn()    { printf '    %sWARN%s  %s\n' "$c_y" "$c_0" "$*"; WARNINGS+=("$*"); }
+problem() { printf '    %sPROBLEM%s %s\n' "$c_r" "$c_0" "$1"; PROBLEMS+=("$1|${2:-}"); }
+die()     { printf '\n%sABORT:%s %s\n' "$c_r" "$c_0" "$*"; printf 'Log and backups: %s\n' "$WORKDIR"; exit 1; }
 trap 'die "unexpected error on line $LINENO (exit $?)"' ERR
 
 confirm() {   # returns 0 if confirmed
@@ -116,7 +120,7 @@ pool_vals() { # values set for an ini key in pool files
     | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*(;.*)?$//' || true
 }
 
-installed() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null | grep -q '^ii'; }
+installed() { [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
 
 sury_packages() {
   dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' \
@@ -165,23 +169,210 @@ restore_ppa() {
   note "PPA sources restored."
 }
 
-MODE=DRY-RUN; if (( APPLY )); then MODE=APPLY; fi
+# plan_packages: map every PPA package to its Ubuntu replacement and simulate the switch.
+# Fills INSTALL/REMOVE/REMOVE_ARGS/LEFTOVER/SIM and reports problems with problem().
+# $1 = 1 to print the mapping.
+plan_packages() {
+  local show=${1:-0} p v ov iv r
+  INSTALL=() REMOVE=() REMOVE_ARGS=() LEFTOVER=() SIM=""
+  local -A reported=()
+  mapfile -t SURY < <(sury_packages)
+  (( ${#SURY[@]} )) || return 0
+  if (( show )); then note "Package mapping (${#SURY[@]} PPA packages):"; fi
+  for p in "${SURY[@]}"; do
+    if [[ $p =~ ^php([0-9]+\.[0-9]+)- ]]; then
+      ov=${BASH_REMATCH[1]}
+      if [[ $ov != "$PHPV" ]]; then
+        if ! has_sapi "$ov"; then
+          REMOVE+=("$p"); REMOVE_ARGS+=("$p-")
+          if (( show )); then note "  $p  ->  remove (no PHP $ov CLI/FPM installed, so nothing can run it)"; fi
+        elif [[ $ov == "$FPMV" ]]; then
+          :   # already reported: the site runs this version
+        elif [[ -z ${reported[$ov]:-} ]]; then
+          reported[$ov]=1
+          if [[ " ${ACTIVE_VERS[*]} " == *" $ov "* ]]; then
+            problem "PHP $ov from the PPA is running; Ubuntu $VERSION_ID has no PHP $ov." \
+                    "Switch the site to PHP $PHPV and stop php$ov-fpm, or use --skip-migrate (mitigations only)."
+          else
+            problem "PHP $ov from the PPA is installed but not running; Ubuntu $VERSION_ID has no PHP $ov." \
+                    "If nothing uses it: apt-get purge 'php$ov*'"
+          fi
+        fi
+        continue
+      fi
+    fi
+    v=$(best_ubuntu_version "$p")
+    if [[ -n $v ]]; then
+      INSTALL+=("$p=$v"); if (( show )); then note "  $p  ->  $v"; fi
+    elif [[ $p == "php$PHPV-imagick" ]]; then
+      iv=$(best_ubuntu_version php-imagick)
+      if [[ -z $iv ]]; then problem "php-imagick isn't available from Ubuntu's repositories." "Enable esm-apps / universe, or remove php$PHPV-imagick if unused."; continue; fi
+      REMOVE+=("$p"); REMOVE_ARGS+=("$p-"); INSTALL+=("php-imagick=$iv")
+      if (( show )); then note "  $p  ->  php-imagick=$iv (Ubuntu's name for it)"; fi
+    elif [[ $p == lib* ]]; then
+      LEFTOVER+=("$p"); if (( show )); then note "  $p  ->  no Ubuntu version; left installed (library, unused afterwards)"; fi
+    else
+      problem "$p (from the PPA) has no Ubuntu equivalent." "Remove it if unused (apt-get purge $p), or handle it manually."
+    fi
+  done
+  (( ${#PROBLEMS[@]} == 0 )) || return 0
+
+  APT_OPTS=(-y -q --allow-downgrades -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+  if ! SIM=$(apt-get install -s "${APT_OPTS[@]}" "${INSTALL[@]}" "${REMOVE_ARGS[@]}" 2>&1); then
+    printf '%s\n' "$SIM" > "$WORKDIR/apt-simulation.txt"
+    problem "apt can't resolve the package switch." "See $WORKDIR/apt-simulation.txt"
+    return 0
+  fi
+  printf '%s\n' "$SIM" > "$WORKDIR/apt-simulation.txt"
+  if (( show )); then
+    note "Planned apt changes (full output: $WORKDIR/apt-simulation.txt):"
+    grep -E '^(Inst|Remv)' <<<"$SIM" | sed 's/^/      /' || true
+  fi
+  while read -r r; do
+    [[ -z $r ]] && continue
+    [[ " ${REMOVE[*]} " == *" $r "* ]] || problem "apt would also remove $r." "Check $WORKDIR/apt-simulation.txt and handle it manually."
+  done < <(awk '/^Remv /{print $2}' <<<"$SIM")
+}
+
+MODE=CHECK; if (( APPLY )); then MODE=APPLY; fi
 printf 'php-esm-migrate.sh   mode: %s   log: %s\n' "$MODE" "$WORKDIR/run.log"
 
-# ================================================================ 1. Puppet
-step "Step 1: Make sure Puppet can't run"
-PUPPET=""
+# ================================================================ preflight (read-only)
+step "Checks (nothing is changed)"
+# shellcheck disable=SC1091
+. /etc/os-release
+case ${VERSION_ID:-} in
+  18.04) PHPV=7.2; FIXED=7.2.24-0ubuntu0.18.04.17+esm14 ;;
+  20.04) PHPV=7.4; FIXED=7.4.3-4ubuntu2.29+esm5 ;;
+  *) die "Supported: Ubuntu 18.04 (PHP 7.2) and 20.04 (PHP 7.4); found ${PRETTY_NAME:-unknown}." ;;
+esac
+ok "$PRETTY_NAME (Ubuntu's PHP for this release is $PHPV)"
+
+# --- which PHP-FPM serves the site
+mapfile -t FPM_VERS < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'php*-fpm' 2>/dev/null \
+                          | awk '$1=="ii" {print $2}' | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm$/\1/p')
+(( ${#FPM_VERS[@]} )) || die "No phpX.Y-fpm package is installed."
+ACTIVE_VERS=()
+for v in "${FPM_VERS[@]}"; do
+  if systemctl is-active --quiet "php$v-fpm" 2>/dev/null; then ACTIVE_VERS+=("$v"); fi
+done
+CANDIDATES=("${FPM_VERS[@]}")
+if (( ${#ACTIVE_VERS[@]} )); then CANDIDATES=("${ACTIVE_VERS[@]}"); fi
+for v in "${CANDIDATES[@]}"; do
+  if [[ $v == "$PHPV" ]]; then FPMV=$v; fi
+done
+[[ -n $FPMV ]] || FPMV=${CANDIDATES[0]}
+src() { [[ $(dpkg-query -W -f='${Version}' "php$1-fpm" 2>/dev/null) == *sury* ]] && echo PPA || echo Ubuntu; }
+DESC=""
+for v in "${FPM_VERS[@]}"; do
+  state="installed"; [[ " ${ACTIVE_VERS[*]} " == *" $v "* ]] && state="running"
+  DESC+="${DESC:+, }$v ($(src "$v"), $state)"
+done
+note "PHP-FPM: $DESC"
+if (( ${#ACTIVE_VERS[@]} == 0 )); then warn "No PHP-FPM service is running"; fi
+if (( ${#ACTIVE_VERS[@]} > 1 )); then warn "Several PHP-FPM versions are running (${ACTIVE_VERS[*]}); only PHP $FPMV is handled."; fi
+FPM_BIN=php-fpm$FPMV FPM_SVC=php$FPMV-fpm ETC_PHP=/etc/php/$FPMV POOL_DIR=/etc/php/$FPMV/fpm/pool.d
+command -v "$FPM_BIN" >/dev/null || die "$FPM_BIN binary not found."
+
+if [[ $FPMV != "$PHPV" ]]; then
+  if (( DO_MIGRATE )); then
+    problem "The site runs PHP $FPMV ($(src "$FPMV")); Ubuntu $VERSION_ID only has PHP $PHPV, so there's no Ubuntu package to move to." \
+            "Switch the site to PHP $PHPV first (then rerun), or use --skip-migrate for mitigations only."
+  else
+    warn "The site runs PHP $FPMV, which gets no fix from Ubuntu on $VERSION_ID: mitigations only."
+  fi
+fi
+if installed "libapache2-mod-php$FPMV"; then
+  warn "libapache2-mod-php$FPMV is installed: mod_php is the highest-risk setup and this script only hardens FPM."
+fi
+shopt -s nullglob; POOLS=("$POOL_DIR"/*.conf); shopt -u nullglob
+(( ${#POOLS[@]} )) || problem "No FPM pool files in $POOL_DIR." "Check the PHP-FPM configuration."
+
+# --- Ubuntu Pro
+PRO=$(command -v pro || command -v ua || true)
+PRO_STATUS=""
+if [[ -n $PRO ]]; then PRO_STATUS=$("$PRO" status 2>/dev/null || true); fi
+if grep -Eq '^esm-infra +yes +enabled' <<<"$PRO_STATUS"; then
+  ok "Ubuntu Pro esm-infra enabled"
+elif (( DO_MIGRATE )); then
+  problem "Ubuntu Pro esm-infra is not enabled; Ubuntu's PHP $PHPV gets no fixes without it." "pro attach <token>  (then: pro enable esm-infra)"
+else
+  warn "Ubuntu Pro esm-infra is not enabled"
+fi
+
+# --- held packages
+HELD=$(apt-mark showhold 2>/dev/null | grep -E '^(php|libapache2-mod-php)' | xargs || true)
+[[ -z $HELD ]] || problem "Packages on hold: $HELD" "apt-mark unhold $HELD"
+
+# --- Puppet
 for c in /opt/puppetlabs/bin/puppet "$(command -v puppet 2>/dev/null || true)"; do
   if [[ -n $c && -x $c ]]; then PUPPET=$c; break; fi
 done
-
 if [[ -z $PUPPET ]]; then
   ok "Puppet is not installed"
 else
-  LOCK=$("$PUPPET" agent --configprint agent_disabled_lockfile 2>/dev/null) \
-    || die "Puppet is installed but '$PUPPET agent --configprint' failed; disable it manually first."
-  RUNLOCK=$("$PUPPET" agent --configprint agent_catalog_run_lockfile 2>/dev/null || true)
+  if LOCK=$("$PUPPET" agent --configprint agent_disabled_lockfile 2>/dev/null); then
+    if [[ -f $LOCK ]]; then ok "Puppet agent already disabled"; else note "Puppet agent will be disabled before any change"; fi
+  else
+    problem "Puppet is installed but its config can't be read." "Disable it manually: puppet agent --disable"
+  fi
+  APPLY_JOBS=$(grep -rlsE 'puppet[^#]*[[:space:]]apply' /etc/crontab /etc/cron.d /etc/cron.hourly \
+                 /etc/cron.daily /var/spool/cron/crontabs /etc/systemd/system 2>/dev/null | xargs || true)
+  [[ -z $APPLY_JOBS ]] || problem "'puppet apply' is scheduled and would ignore the agent lock: $APPLY_JOBS" "Disable those jobs first."
+fi
 
+# --- is the fix available?
+BEST=$(best_ubuntu_version "php$PHPV-common")
+FIX_AVAILABLE=0
+if [[ -n $BEST ]] && dpkg --compare-versions "$BEST" ge "$FIXED"; then
+  FIX_AVAILABLE=1
+  ok "Fixed PHP $PHPV is available from Ubuntu ($BEST)"
+else
+  warn "Fixed PHP $PHPV ($FIXED) isn't available yet (best: ${BEST:-none})"
+  if (( ! DO_MITIGATE )); then
+    warn "--skip-mitigate with no fix available leaves this host unpatched and unmitigated"
+  fi
+fi
+
+# --- package plan (only if nothing above already blocks it)
+if (( DO_MIGRATE )); then
+  # Run even if something else already failed, so every problem is listed at once.
+  plan_packages "$(( ${#PROBLEMS[@]} == 0 ))"
+  if (( ${#PROBLEMS[@]} == 0 )); then
+    if (( ${#INSTALL[@]} + ${#REMOVE[@]} )); then ok "Package switch resolves cleanly"; else ok "No PPA packages installed"; fi
+  fi
+fi
+
+# --- verdict
+step "Assessment"
+note "Site PHP:     $FPMV ($(src "$FPMV"))"
+note "Packages:     $( (( DO_MIGRATE )) && echo "switch PHP $PHPV to Ubuntu ESM" || echo "unchanged (--skip-migrate)")"
+note "Config:       $( (( DO_MITIGATE )) && echo "full mitigations" || echo "session.upload_progress off only (--skip-mitigate)")"
+note "Ubuntu fix:   $( (( FIX_AVAILABLE )) && echo "available" || echo "not available yet")"
+if (( ${#PROBLEMS[@]} )); then
+  printf '\n    %s%d problem(s) must be fixed first; nothing was changed:%s\n' "$c_r" "${#PROBLEMS[@]}" "$c_0"
+  for p in "${PROBLEMS[@]}"; do
+    printf '    - %s\n' "${p%%|*}"
+    [[ -n ${p#*|} ]] && printf '        -> %s\n' "${p#*|}"
+  done
+  printf '\nLog: %s\n' "$WORKDIR/run.log"
+  exit 1
+fi
+note "Ready."
+
+if (( APPLY )); then
+  note "Rolling back the package switch means restoring a snapshot (the repacked .debs saved here are a backup)."
+  confirm "Have you taken a snapshot of this server?" || die "Take a snapshot first, then rerun."
+fi
+
+"$FPM_BIN" -m > "$WORKDIR/modules-before.txt" 2>/dev/null || true
+
+# ================================================================ 1. Puppet
+step "Step 1: Make sure Puppet can't run"
+if [[ -z $PUPPET ]]; then
+  ok "Puppet is not installed"
+else
+  RUNLOCK=$("$PUPPET" agent --configprint agent_catalog_run_lockfile 2>/dev/null || true)
   if [[ -f $LOCK ]]; then
     ok "Puppet agent already disabled: $(cat "$LOCK" 2>/dev/null)"
   elif (( APPLY )); then
@@ -189,9 +380,8 @@ else
     [[ -f $LOCK ]] || die "puppet agent --disable did not create $LOCK"
     ok "Puppet agent disabled ($LOCK)"
   else
-    note "(dry-run) would run: $PUPPET agent --disable \"CVE-2026-109618/109619 ...\""
+    note "(check) would run: $PUPPET agent --disable \"CVE-2026-109618/109619 ...\""
   fi
-
   if [[ -n $RUNLOCK && -f $RUNLOCK ]]; then
     PID=$(cat "$RUNLOCK" 2>/dev/null || true)
     if [[ -n $PID ]] && kill -0 "$PID" 2>/dev/null; then
@@ -205,87 +395,6 @@ else
       fi
     fi
   fi
-
-  # The agent lock does not stop `puppet apply` from cron or timers.
-  APPLY_JOBS=$(grep -rlsE 'puppet[^#]*[[:space:]]apply' /etc/crontab /etc/cron.d /etc/cron.hourly \
-                 /etc/cron.daily /var/spool/cron/crontabs /etc/systemd/system 2>/dev/null || true)
-  if [[ -n $APPLY_JOBS ]]; then
-    if (( APPLY )); then
-      die "'puppet apply' is scheduled here and ignores 'puppet agent --disable'. Disable these first: $APPLY_JOBS"
-    fi
-    warn "'puppet apply' is scheduled and ignores the agent lock; disable before --apply: $APPLY_JOBS"
-  else
-    ok "No scheduled 'puppet apply' jobs found"
-  fi
-fi
-
-# ================================================================ preflight
-step "Preflight"
-# shellcheck disable=SC1091
-. /etc/os-release
-case ${VERSION_ID:-} in
-  18.04) PHPV=7.2 ;;
-  20.04) PHPV=7.4 ;;
-  *) die "Supported: Ubuntu 18.04 (PHP 7.2) and 20.04 (PHP 7.4); found ${PRETTY_NAME:-unknown}." ;;
-esac
-ok "$PRETTY_NAME (Ubuntu's own PHP for this release is $PHPV)"
-
-mapfile -t FPM_VERS < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'php*-fpm' 2>/dev/null \
-                          | awk '$1=="ii" {print $2}' | sed -nE 's/^php([0-9]+\.[0-9]+)-fpm$/\1/p')
-(( ${#FPM_VERS[@]} )) || die "No phpX.Y-fpm package is installed."
-# Prefer the PHP-FPM that is actually running: that's what serves the site.
-ACTIVE_VERS=()
-for v in "${FPM_VERS[@]}"; do
-  if systemctl is-active --quiet "php$v-fpm" 2>/dev/null; then ACTIVE_VERS+=("$v"); fi
-done
-CANDIDATES=("${FPM_VERS[@]}")
-if (( ${#ACTIVE_VERS[@]} )); then
-  CANDIDATES=("${ACTIVE_VERS[@]}")
-  ok "PHP-FPM running: ${ACTIVE_VERS[*]} (installed: ${FPM_VERS[*]})"
-else
-  warn "No PHP-FPM service is running (installed: ${FPM_VERS[*]})"
-fi
-for v in "${CANDIDATES[@]}"; do
-  if [[ $v == "$PHPV" ]]; then FPMV=$v; fi
-done
-if [[ -z $FPMV ]]; then
-  if (( ${#CANDIDATES[@]} > 1 )); then
-    die "Several PHP-FPM versions are ${ACTIVE_VERS[*]:+running}${ACTIVE_VERS[*]:-installed} (${CANDIDATES[*]}) and none is Ubuntu's $PHPV; handle this host manually."
-  fi
-  FPMV=${CANDIDATES[0]}
-  if (( DO_MIGRATE )); then
-    die "This host runs PHP-FPM $FPMV, but Ubuntu $VERSION_ID only packages PHP $PHPV, so leaving the PPA means upgrading PHP, which this script doesn't do. Rerun with --skip-migrate to apply the config mitigations only."
-  fi
-  warn "PHP-FPM $FPMV is not Ubuntu's PHP for this release: config mitigations only, and no fix will come from Ubuntu for it."
-elif (( ${#CANDIDATES[@]} > 1 )); then
-  warn "Other PHP-FPM versions are running too (${CANDIDATES[*]}); only PHP $FPMV is handled."
-fi
-FPM_BIN=php-fpm$FPMV FPM_SVC=php$FPMV-fpm ETC_PHP=/etc/php/$FPMV POOL_DIR=/etc/php/$FPMV/fpm/pool.d
-command -v "$FPM_BIN" >/dev/null || die "$FPM_BIN binary not found."
-ok "php$FPMV-fpm $(dpkg-query -W -f='${Version}' "php$FPMV-fpm")"
-if installed "libapache2-mod-php$FPMV"; then
-  warn "libapache2-mod-php$FPMV is installed: mod_php is the highest-risk setup and this script only hardens FPM."
-fi
-
-PRO=$(command -v pro || command -v ua || true)
-PRO_STATUS=""
-if [[ -n $PRO ]]; then PRO_STATUS=$("$PRO" status 2>/dev/null || true); fi
-if grep -Eq '^esm-infra +yes +enabled' <<<"$PRO_STATUS"; then
-  ok "Ubuntu Pro esm-infra enabled"
-elif (( DO_MIGRATE )); then
-  die "Ubuntu Pro esm-infra is not enabled (check 'pro status'); without it Ubuntu's PHP $PHPV gets no fixes."
-else
-  warn "Ubuntu Pro esm-infra is not enabled"
-fi
-
-HELD=$(apt-mark showhold 2>/dev/null | grep -E '^(php|libapache2-mod-php)' || true)
-[[ -z $HELD ]] || die "These packages are on hold; run 'apt-mark unhold' on them first: $(echo "$HELD" | tr '\n' ' ')"
-
-"$FPM_BIN" -m > "$WORKDIR/modules-before.txt" 2>/dev/null || true
-
-if (( APPLY )); then
-  note "Rolling back the package switch means restoring a snapshot (the repacked .debs saved here are a backup)."
-  confirm "Have you taken a snapshot of this server?" || die "Take a snapshot first, then rerun."
 fi
 
 # ================================================================ 2. Backups
@@ -315,11 +424,11 @@ if (( APPLY )); then
     fi
   fi
 else
-  note "(dry-run) would back up $ETC_PHP, apt sources, the package list, and repack the PPA packages"
+  note "(check) would back up $ETC_PHP, apt sources, the package list, and repack the PPA packages"
 fi
 
 # ================================================================ 3. Mitigations
-step "Step 3: FPM config mitigations"
+step "Step 3: FPM config"
 FULL_MARK='CVE-2026-109618/109619 mitigation'
 UP_MARK='session upload progress off'
 SYSTEMD_DROPIN=/etc/systemd/system/$FPM_SVC.service.d/zz-cve-2026-109618.conf
@@ -335,13 +444,7 @@ else
   note "--skip-mitigate: only turning off session.upload_progress (keep it off even after patching)"
 fi
 
-{
-  shopt -s nullglob
-  POOLS=("$POOL_DIR"/*.conf)
-  shopt -u nullglob
-  (( ${#POOLS[@]} )) || die "No pool files found in $POOL_DIR"
-
-  if (( ! DO_MITIGATE )); then
+if (( ! DO_MITIGATE )); then
   note "session.upload_progress.enabled  $(fpm_ini session.upload_progress.enabled) -> 0"
   if (( MAXREQ1 )); then note "pm.max_requests                  -> 1 (every pool)"; fi
   cat > "$WORKDIR/new/dropin.ini" <<EOF
@@ -352,8 +455,7 @@ EOF
   POOL_BLOCK="; >>> $MARK (php-esm-migrate.sh $TS)
 php_admin_flag[session.upload_progress.enabled] = off"
   KEYS='session\.upload_progress\.enabled'
-  else
-
+else
   # Work out targets: never raise an existing limit.
   mapfile -t PV < <(pool_vals post_max_size)
   mapfile -t UV < <(pool_vals upload_max_filesize)
@@ -380,7 +482,6 @@ php_admin_flag[session.upload_progress.enabled] = off"
   if (( MAXREQ1 )); then note "pm.max_requests                  -> 1 (every pool)"; fi
   note "(If the site needs uploads bigger than $TARGET_UP, raise it with --post-max; the advisory suggests <= 32M.)"
 
-  # php.ini drop-in (startup config, applies before any request)
   cat > "$WORKDIR/new/dropin.ini" <<EOF
 ; $MARK, added by php-esm-migrate.sh on $TS.
 ; Interim hardening until Ubuntu's fixed PHP is installed.
@@ -391,8 +492,7 @@ upload_max_filesize = $TARGET_UP
 max_input_nesting_level = $TARGET_NEST
 session.upload_progress.enabled = 0
 EOF
-
-  # Pool block: php_admin_* so applications can't ini_set() a finite memory_limit back.
+  # php_admin_* so applications can't ini_set() a finite memory_limit back.
   POOL_BLOCK="; >>> $MARK (php-esm-migrate.sh $TS)
 php_admin_value[memory_limit] = -1
 php_admin_value[post_max_size] = $TARGET_POST
@@ -400,32 +500,32 @@ php_admin_value[upload_max_filesize] = $TARGET_UP
 php_admin_value[max_input_nesting_level] = $TARGET_NEST
 php_admin_flag[session.upload_progress.enabled] = off"
   KEYS='memory_limit|post_max_size|upload_max_filesize|max_input_nesting_level|session\.upload_progress\.enabled'
+fi
+if (( MAXREQ1 )); then POOL_BLOCK+=$'\npm.max_requests = 1'; fi
+POOL_BLOCK+=$'\n; <<< '"$MARK"
+export POOL_BLOCK
+
+for f in "${POOLS[@]}"; do
+  out="$WORKDIR/new/pool-$(basename "$f")"
+  if grep -qF "$MARK" "$f" || { (( ! DO_MITIGATE )) && grep -qF "$FULL_MARK" "$f"; }; then
+    note "$(basename "$f"): already done, leaving as is"
+    cp "$f" "$out"; continue
   fi
-  if (( MAXREQ1 )); then POOL_BLOCK+=$'\npm.max_requests = 1'; fi
-  POOL_BLOCK+=$'\n; <<< '"$MARK"
-  export POOL_BLOCK
+  # Comment out existing settings for the same keys (a later line would win over ours).
+  sed -E "s/^([[:space:]]*php(_admin)?_(value|flag)\[($KEYS)\].*)$/;[disabled by php-esm-migrate $TS] \1/" "$f" > "$out.tmp"
+  if (( MAXREQ1 )); then
+    sed -i -E "s/^([[:space:]]*pm\.max_requests[[:space:]]*=.*)$/;[disabled by php-esm-migrate $TS] \1/" "$out.tmp"
+  fi
+  # Insert our block right after every [pool] header.
+  awk '{print} /^[[:space:]]*\[.+\][[:space:]]*$/ && !/\[global\]/ {print ENVIRON["POOL_BLOCK"]}' "$out.tmp" > "$out"
+  rm -f "$out.tmp"
+  grep -qF "$MARK" "$out" || die "$(basename "$f"): no [pool] section header found"
+  note "Changes to $f:"
+  diff -u "$f" "$out" | sed 's/^/      /' || true
+done
 
-  for f in "${POOLS[@]}"; do
-    out="$WORKDIR/new/pool-$(basename "$f")"
-    if grep -qF "$MARK" "$f" || { (( ! DO_MITIGATE )) && grep -qF "$FULL_MARK" "$f"; }; then
-      note "$(basename "$f"): mitigation block already present, leaving as is"
-      cp "$f" "$out"; continue
-    fi
-    # Comment out existing settings for the same keys (a later line would win over ours).
-    sed -E "s/^([[:space:]]*php(_admin)?_(value|flag)\[($KEYS)\].*)$/;[disabled by php-esm-migrate $TS] \1/" "$f" > "$out.tmp"
-    if (( MAXREQ1 )); then
-      sed -i -E "s/^([[:space:]]*pm\.max_requests[[:space:]]*=.*)$/;[disabled by php-esm-migrate $TS] \1/" "$out.tmp"
-    fi
-    # Insert our block right after every [pool] header.
-    awk '{print} /^[[:space:]]*\[.+\][[:space:]]*$/ && !/\[global\]/ {print ENVIRON["POOL_BLOCK"]}' "$out.tmp" > "$out"
-    rm -f "$out.tmp"
-    grep -qF "$MARK" "$out" || die "$(basename "$f"): no [pool] section header found"
-    note "Changes to $f:"
-    diff -u "$f" "$out" | sed 's/^/      /' || true
-  done
-
-  # systemd: replace PHP's per-request memory cap with a service-level one.
-  if (( DO_MITIGATE )); then
+if (( DO_MITIGATE )); then
+  # Replace PHP's per-request memory cap with a service-level one.
   if [[ -z $MEMCAP ]]; then
     MEMCAP="$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) * 3 / 4 / 1024 ))M"
   fi
@@ -441,151 +541,93 @@ LimitDATA=infinity
 Restart=on-failure
 EOF
   note "systemd MemoryLimit for $FPM_SVC: $MEMCAP"
-  fi
+fi
 
-  PVAL=$(grep -rnsE 'PHP_(ADMIN_)?VALUE' /etc/nginx /etc/apache2 2>/dev/null || true)
-  if [[ -z $PVAL ]]; then
-    ok "Web server does not pass per-request PHP_VALUE/PHP_ADMIN_VALUE"
-  else
-    warn "Web server passes per-request PHP settings; remove invalid/deprecated ones, prefer pool config:"
-    printf '%s\n' "$PVAL" | sed 's/^/      /'
-  fi
+PVAL=$(grep -rnsE 'PHP_(ADMIN_)?VALUE' /etc/nginx /etc/apache2 2>/dev/null || true)
+if [[ -z $PVAL ]]; then
+  ok "Web server does not pass per-request PHP_VALUE/PHP_ADMIN_VALUE"
+else
+  warn "Web server passes per-request PHP settings; remove invalid/deprecated ones, prefer pool config:"
+  printf '%s\n' "$PVAL" | sed 's/^/      /'
+fi
 
-  if (( APPLY )); then
-    SYSTEMD_HAD=0; [[ -e $SYSTEMD_DROPIN ]] && SYSTEMD_HAD=1
-    install -m 0644 "$WORKDIR/new/dropin.ini" "$DROPIN_INI"
-    for f in "${POOLS[@]}"; do cat "$WORKDIR/new/pool-$(basename "$f")" > "$f"; done
-    if (( DO_MITIGATE )); then
-      mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
-      install -m 0644 "$WORKDIR/new/systemd.conf" "$SYSTEMD_DROPIN"
-    fi
-    if ! "$FPM_BIN" -t >"$WORKDIR/fpm-test.txt" 2>&1; then
-      sed 's/^/      /' "$WORKDIR/fpm-test.txt"
-      rm -f "$DROPIN_INI"
-      if (( DO_MITIGATE && ! SYSTEMD_HAD )); then rm -f "$SYSTEMD_DROPIN"; fi
-      tar -xzf "$WORKDIR/etc-php-$FPMV.tgz" -C /
-      systemctl daemon-reload
-      die "$FPM_BIN -t rejected the new config; original config restored."
-    fi
+if (( APPLY )); then
+  SYSTEMD_HAD=0; [[ -e $SYSTEMD_DROPIN ]] && SYSTEMD_HAD=1
+  install -m 0644 "$WORKDIR/new/dropin.ini" "$DROPIN_INI"
+  for f in "${POOLS[@]}"; do cat "$WORKDIR/new/pool-$(basename "$f")" > "$f"; done
+  if (( DO_MITIGATE )); then
+    mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
+    install -m 0644 "$WORKDIR/new/systemd.conf" "$SYSTEMD_DROPIN"
+  fi
+  if ! "$FPM_BIN" -t >"$WORKDIR/fpm-test.txt" 2>&1; then
+    sed 's/^/      /' "$WORKDIR/fpm-test.txt"
+    rm -f "$DROPIN_INI"
+    if (( DO_MITIGATE && ! SYSTEMD_HAD )); then rm -f "$SYSTEMD_DROPIN"; fi
+    tar -xzf "$WORKDIR/etc-php-$FPMV.tgz" -C /
     systemctl daemon-reload
-    systemctl restart "$FPM_SVC"
-    systemctl is-active --quiet "$FPM_SVC" || die "$FPM_SVC did not come back up (journalctl -u $FPM_SVC)."
-    ok "Config changes in place, $FPM_SVC restarted"
-  else
-    if (( DO_MITIGATE )); then
-      note "(dry-run) would write $DROPIN_INI, the pool changes above, $SYSTEMD_DROPIN, then test and restart $FPM_SVC"
-    else
-      note "(dry-run) would write $DROPIN_INI and the pool changes above, then test and restart $FPM_SVC"
-    fi
+    die "$FPM_BIN -t rejected the new config; original config restored."
   fi
-}
+  systemctl daemon-reload
+  systemctl restart "$FPM_SVC"
+  systemctl is-active --quiet "$FPM_SVC" || die "$FPM_SVC did not come back up (journalctl -u $FPM_SVC)."
+  ok "Config changes in place, $FPM_SVC restarted"
+else
+  if (( DO_MITIGATE )); then
+    note "(check) would write $DROPIN_INI, the pool changes above, $SYSTEMD_DROPIN, then test and restart $FPM_SVC"
+  else
+    note "(check) would write $DROPIN_INI and the pool changes above, then test and restart $FPM_SVC"
+  fi
+fi
 
 # ================================================================ 4. Migration
 step "Step 4: Move PHP $PHPV from the ondrej PPA to Ubuntu ESM packages"
 if (( ! DO_MIGRATE )); then
   note "Skipped (--skip-migrate)"
+elif [[ -z $(sury_packages) ]]; then
+  ok "No ondrej/Sury packages installed"
+elif (( ! APPLY )); then
+  note "(check) would disable the ondrej PPA and make the package changes listed above"
 else
-  mapfile -t SURY < <(sury_packages)
-  if (( ${#SURY[@]} == 0 )); then
-    ok "No ondrej/Sury packages installed"
+  # esm-apps covers universe (php-imagick and some php*-* binaries)
+  if grep -Eq '^esm-apps +yes +enabled' <<<"$PRO_STATUS"; then
+    ok "esm-apps enabled"
+  elif grep -Eq '^esm-apps +yes' <<<"$PRO_STATUS"; then
+    "$PRO" enable esm-apps --assume-yes; ok "esm-apps enabled"
   else
-    note "${#SURY[@]} packages installed from the PPA"
-
-    # esm-apps covers universe (php-imagick and some php*-* binaries)
-    if grep -Eq '^esm-apps +yes +enabled' <<<"$PRO_STATUS"; then
-      ok "esm-apps enabled"
-    elif grep -Eq '^esm-apps +yes' <<<"$PRO_STATUS"; then
-      if (( APPLY )); then "$PRO" enable esm-apps --assume-yes; ok "esm-apps enabled"
-      else note "(dry-run) would run: $PRO enable esm-apps"; fi
-    else
-      warn "esm-apps isn't available on this subscription; universe packages (php-imagick etc.) won't get ESM fixes"
-    fi
-
-    # Find the PPA in apt sources
-    mapfile -t PPA_LISTS < <(grep -lsE '^[[:space:]]*deb[^#]*ondrej/php' /etc/apt/sources.list.d/*.list 2>/dev/null || true)
-    mapfile -t PPA_SAVES < <(find /etc/apt/sources.list.d -maxdepth 1 -name '*ondrej*php*.save' 2>/dev/null)
-    SL_HIT=$(grep -cE '^[[:space:]]*deb[^#]*ondrej/php' /etc/apt/sources.list 2>/dev/null || true)
-    SL_HIT=${SL_HIT:-0}
-
-    if (( APPLY )); then
-      for f in "${PPA_LISTS[@]}"; do mv "$f" "$f.$TS.disabled"; note "disabled $f"; done
-      for f in "${PPA_SAVES[@]}"; do mv "$f" "$WORKDIR/"; done
-      if (( SL_HIT )); then
-        sed -i -E "s|^([[:space:]]*deb[^#]*ondrej/php.*)$|# disabled by php-esm-migrate $TS: \1|" /etc/apt/sources.list
-        note "commented out ondrej/php in /etc/apt/sources.list"
-      fi
-      wait_for_apt
-      apt-get update -q
-    else
-      note "(dry-run) would disable PPA source(s): ${PPA_LISTS[*]:-none}${PPA_SAVES[*]:+ (and move ${PPA_SAVES[*]})}"
-      note "(dry-run) plan below uses current apt lists; the real run disables the PPA first"
-    fi
-
-    note "Package mapping:"
-    for p in "${SURY[@]}"; do
-      if [[ $p =~ ^php([0-9]+\.[0-9]+)- ]]; then
-        ov=${BASH_REMATCH[1]}
-        if [[ $ov != "$PHPV" ]]; then
-          if has_sapi "$ov"; then
-            PROBLEMS+=("$p")
-          else
-            REMOVE+=("$p"); REMOVE_ARGS+=("$p-")
-            note "  $p  ->  remove (no PHP $ov CLI/FPM installed, so nothing can run it)"
-          fi
-          continue
-        fi
-      fi
-      v=$(best_ubuntu_version "$p")
-      if [[ -n $v ]]; then
-        INSTALL+=("$p=$v"); note "  $p  ->  $v"
-      elif [[ $p == "php$PHPV-imagick" ]]; then
-        iv=$(best_ubuntu_version php-imagick)
-        [[ -n $iv ]] || die "php-imagick is not available from the Ubuntu repositories"
-        REMOVE+=("$p"); REMOVE_ARGS+=("$p-"); INSTALL+=("php-imagick=$iv")
-        note "  $p  ->  php-imagick=$iv (Ubuntu's name for it)"
-      elif [[ $p == lib* ]]; then
-        LEFTOVER+=("$p"); note "  $p  ->  no Ubuntu version; left installed (library, unused afterwards)"
-      else
-        PROBLEMS+=("$p")
-      fi
-    done
-    if (( ${#PROBLEMS[@]} )); then
-      if (( APPLY )); then restore_ppa; fi
-      die "No Ubuntu replacement for: ${PROBLEMS[*]}. If that PHP version isn't used, purge it (e.g. apt-get purge 'php7.3*') and rerun; otherwise handle this host manually."
-    fi
-
-    APT_OPTS=(-y -q --allow-downgrades -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-    if ! SIM=$(apt-get install -s "${APT_OPTS[@]}" "${INSTALL[@]}" "${REMOVE_ARGS[@]}" 2>&1); then
-      printf '%s\n' "$SIM" | tail -n 30 | sed 's/^/      /'
-      if (( APPLY )); then restore_ppa; fi
-      die "apt could not resolve the switch (simulation failed)."
-    fi
-    printf '%s\n' "$SIM" > "$WORKDIR/apt-simulation.txt"
-    note "Planned apt changes (full output: $WORKDIR/apt-simulation.txt):"
-    grep -E '^(Inst|Remv)' <<<"$SIM" | sed 's/^/      /' || true
-
-    UNEXPECTED=$(awk '/^Remv /{print $2}' <<<"$SIM" | while read -r r; do
-                   [[ " ${REMOVE[*]} " == *" $r "* ]] || echo "$r"; done)
-    if [[ -n $UNEXPECTED ]]; then
-      if (( APPLY )); then restore_ppa; fi
-      die "apt wants to remove packages this script didn't plan to: $(echo "$UNEXPECTED" | tr '\n' ' ')"
-    fi
-    ok "No unexpected removals"
-
-    if (( APPLY )); then
-      if ! confirm "Proceed with the package changes above?"; then
-        restore_ppa
-        die "Package switch not confirmed. Config mitigations (if any) are still in place."
-      fi
-      wait_for_apt
-      DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 \
-        apt-get install "${APT_OPTS[@]}" "${INSTALL[@]}" "${REMOVE_ARGS[@]}"
-      systemctl restart "$FPM_SVC"
-      ok "Packages switched to Ubuntu ESM"
-    else
-      note "(dry-run) no packages changed"
-    fi
+    warn "esm-apps isn't available on this subscription; universe packages (php-imagick etc.) won't get ESM fixes"
   fi
+
+  mapfile -t PPA_LISTS < <(grep -lsE '^[[:space:]]*deb[^#]*ondrej/php' /etc/apt/sources.list.d/*.list 2>/dev/null || true)
+  mapfile -t PPA_SAVES < <(find /etc/apt/sources.list.d -maxdepth 1 -name '*ondrej*php*.save' 2>/dev/null)
+  SL_HIT=$(grep -cE '^[[:space:]]*deb[^#]*ondrej/php' /etc/apt/sources.list 2>/dev/null || true)
+  SL_HIT=${SL_HIT:-0}
+  for f in "${PPA_LISTS[@]}"; do mv "$f" "$f.$TS.disabled"; note "disabled $f"; done
+  for f in "${PPA_SAVES[@]}"; do mv "$f" "$WORKDIR/"; done
+  if (( SL_HIT )); then
+    sed -i -E "s|^([[:space:]]*deb[^#]*ondrej/php.*)$|# disabled by php-esm-migrate $TS: \1|" /etc/apt/sources.list
+    note "commented out ondrej/php in /etc/apt/sources.list"
+  fi
+  wait_for_apt
+  apt-get update -q
+
+  # Re-plan against the updated lists (PPA gone) before touching packages.
+  PROBLEMS=()
+  plan_packages 1
+  if (( ${#PROBLEMS[@]} )); then
+    restore_ppa
+    die "The package plan changed after disabling the PPA (see PROBLEM lines above). Config changes are in place; packages untouched."
+  fi
+  ok "No unexpected removals"
+
+  if ! confirm "Proceed with the package changes above?"; then
+    restore_ppa
+    die "Package switch not confirmed. Config changes are in place; packages untouched."
+  fi
+  wait_for_apt
+  DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 \
+    apt-get install "${APT_OPTS[@]}" "${INSTALL[@]}" "${REMOVE_ARGS[@]}"
+  systemctl restart "$FPM_SVC"
+  ok "Packages switched to Ubuntu ESM"
 fi
 
 # ================================================================ 5. Verify
@@ -600,8 +642,9 @@ if (( APPLY )); then
     if [[ -z $LEFT ]]; then ok "No PPA PHP packages left"
     else warn "Still installed from the PPA: $(echo "$LEFT" | tr '\n' ' ')"; fi
     CV=$(dpkg-query -W -f='${Version}' "php$PHPV-common")
-    if [[ $CV != *sury* ]]; then ok "php$PHPV-common $CV (Ubuntu ESM track)"
-    else warn "php$PHPV-common is $CV, still the PPA build"; fi
+    if [[ $CV == *sury* ]]; then warn "php$PHPV-common is $CV, still the PPA build"
+    elif dpkg --compare-versions "$CV" ge "$FIXED"; then ok "php$PHPV-common $CV (Ubuntu ESM, includes the fix)"
+    else ok "php$PHPV-common $CV (Ubuntu ESM; fix not installed yet)"; fi
 
     # Shared libraries (libpcre, libzip, ...) were swapped too; anything started before
     # the switch still has the old copy mapped until it restarts.
@@ -638,7 +681,7 @@ if (( APPLY )); then
     else warn "session.upload_progress.enabled is still '$UPV'"; fi
   fi
 else
-  note "(dry-run) nothing to verify"
+  note "(check) nothing to verify"
 fi
 
 # ================================================================ summary
@@ -650,11 +693,13 @@ if (( ${#WARNINGS[@]} )); then
 fi
 
 if (( ! APPLY )); then
+  FLAGS=""
+  (( DO_MIGRATE )) || FLAGS+=" --skip-migrate"
+  (( DO_MITIGATE )) || FLAGS+=" --skip-mitigate"
   cat <<EOF
 
-Dry run complete; nothing was changed. Review the plan above, take a snapshot,
-then run:   sudo $0 --apply $( (( DO_MIGRATE )) || echo --skip-migrate )
-Plan files: $WORKDIR
+Check complete; nothing was changed. Take a snapshot, then run:
+    bash $0 --apply$FLAGS
 EOF
   exit 0
 fi
@@ -662,23 +707,21 @@ fi
 cat <<EOF
 
 Next:
-  * Test the site now: logins, forms, uploads, image handling, database paths.
+  * Test the site: logins, forms, uploads, image handling, database paths.
   * Puppet is still DISABLED. Before 'puppet agent --enable', update the Puppet code so it
     no longer adds the ondrej PPA or pins Sury versions, and carries these php.ini, pool
     and systemd settings. Otherwise the next run may undo all of this.
 EOF
 if (( DO_MIGRATE )); then
   cat <<EOF
-  * When Ubuntu's fixed php$PHPV reaches the ESM repository, install it and restart FPM:
-      apt-get update
-      apt-get install --only-upgrade \$(dpkg-query -W -f='\${db:Status-Abbrev} \${Package}\n' 'php$PHPV-*' | awk '\$1=="ii"{print \$2}')
-      systemctl restart $FPM_SVC
+  * Unattended upgrades will install future PHP fixes, but don't restart PHP-FPM:
+      systemctl restart $FPM_SVC     # after each PHP update
   * Rollback: restore the snapshot. Partial fallback:
       dpkg -i $WORKDIR/debs/*.deb && tar -xzf $WORKDIR/etc-php-$FPMV.tgz -C / && systemctl restart $FPM_SVC
 EOF
 else
   cat <<EOF
-  * This host's PHP $FPMV gets no fix from Ubuntu; plan its move to Ubuntu's PHP $PHPV.
+  * PHP $FPMV here gets no fix from Ubuntu; plan the move to Ubuntu's PHP $PHPV.
 EOF
 fi
 printf '\nLog and backups: %s\n' "$WORKDIR"
