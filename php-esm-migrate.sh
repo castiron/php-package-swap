@@ -177,8 +177,7 @@ plan_packages() {
   INSTALL=() REMOVE=() REMOVE_ARGS=() LEFTOVER=() SIM=""
   local -A reported=()
   mapfile -t SURY < <(sury_packages)
-  (( ${#SURY[@]} )) || return 0
-  if (( show )); then note "Package mapping (${#SURY[@]} PPA packages):"; fi
+  if (( ${#SURY[@]} )) && (( show )); then note "Package mapping (${#SURY[@]} PPA packages):"; fi
   for p in "${SURY[@]}"; do
     if [[ $p =~ ^php([0-9]+\.[0-9]+)- ]]; then
       ov=${BASH_REMATCH[1]}
@@ -216,6 +215,8 @@ plan_packages() {
     fi
   done
   (( ${#PROBLEMS[@]} == 0 )) || return 0
+  plan_ubuntu_updates "$show"
+  if (( ${#INSTALL[@]} + ${#REMOVE[@]} == 0 )); then SIM=""; return 0; fi
 
   APT_OPTS=(-y -q --allow-downgrades -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
   if ! SIM=$(apt-get install -s "${APT_OPTS[@]}" "${INSTALL[@]}" "${REMOVE_ARGS[@]}" 2>&1); then
@@ -234,6 +235,22 @@ plan_packages() {
   done < <(awk '/^Remv /{print $2}' <<<"$SIM")
 }
 
+# plan_ubuntu_updates: Ubuntu-built php$PHPV-* packages already installed but older than
+# the best Ubuntu version (e.g. already migrated, but on esm13 while esm14 is out).
+plan_ubuntu_updates() {
+  local show=${1:-0} p cur best n=0
+  while read -r p cur; do
+    [[ -z $p || $cur == *sury* ]] && continue
+    best=$(best_ubuntu_version "$p")
+    if [[ -n $best ]] && dpkg --compare-versions "$best" gt "$cur"; then
+      if (( show && n == 0 )); then note "Ubuntu PHP updates to install:"; fi
+      INSTALL+=("$p=$best"); n=$((n + 1))
+      if (( show )); then note "  $p  $cur  ->  $best"; fi
+    fi
+  done < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' "php$PHPV-*" php-common php-imagick 2>/dev/null \
+             | awk '$1=="ii" {print $2, $3}')
+}
+
 MODE=CHECK; if (( APPLY )); then MODE=APPLY; fi
 printf 'php-esm-migrate.sh   mode: %s   log: %s\n' "$MODE" "$WORKDIR/run.log"
 
@@ -247,6 +264,12 @@ case ${VERSION_ID:-} in
   *) die "Supported: Ubuntu 18.04 (PHP 7.2) and 20.04 (PHP 7.4); found ${PRETTY_NAME:-unknown}." ;;
 esac
 ok "$PRETTY_NAME (Ubuntu's PHP for this release is $PHPV)"
+wait_for_apt
+if apt-get update -qq >"$WORKDIR/apt-update.txt" 2>&1; then
+  ok "Package lists refreshed"
+else
+  warn "apt-get update reported errors (see $WORKDIR/apt-update.txt); package info may be stale"
+fi
 
 # --- which PHP-FPM serves the site
 mapfile -t FPM_VERS < <(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'php*-fpm' 2>/dev/null \
@@ -339,7 +362,7 @@ if (( DO_MIGRATE )); then
   # Run even if something else already failed, so every problem is listed at once.
   plan_packages "$(( ${#PROBLEMS[@]} == 0 ))"
   if (( ${#PROBLEMS[@]} == 0 )); then
-    if (( ${#INSTALL[@]} + ${#REMOVE[@]} )); then ok "Package switch resolves cleanly"; else ok "No PPA packages installed"; fi
+    if (( ${#INSTALL[@]} + ${#REMOVE[@]} )); then ok "Package changes resolve cleanly"; else ok "PHP packages already on Ubuntu's latest; nothing to install"; fi
   fi
 fi
 
@@ -583,10 +606,10 @@ fi
 step "Step 4: Move PHP $PHPV from the ondrej PPA to Ubuntu ESM packages"
 if (( ! DO_MIGRATE )); then
   note "Skipped (--skip-migrate)"
-elif [[ -z $(sury_packages) ]]; then
-  ok "No ondrej/Sury packages installed"
+elif (( ${#INSTALL[@]} + ${#REMOVE[@]} == 0 )); then
+  ok "Nothing to install"
 elif (( ! APPLY )); then
-  note "(check) would disable the ondrej PPA and make the package changes listed above"
+  note "(check) would disable the ondrej PPA (if present) and make the package changes listed above"
 else
   # esm-apps covers universe (php-imagick and some php*-* binaries)
   if grep -Eq '^esm-apps +yes +enabled' <<<"$PRO_STATUS"; then
