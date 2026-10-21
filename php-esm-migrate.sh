@@ -31,7 +31,8 @@
 #   --memcap SIZE      systemd MemoryLimit for PHP-FPM (default: 75% of RAM)
 #   --max-requests-1   set pm.max_requests = 1 in every pool (strong mitigation for
 #                      CVE-2026-109619; costs CPU because every request gets a fresh worker)
-#   --skip-mitigate    don't touch PHP/FPM config
+#   --skip-mitigate    skip the interim mitigations; only turn off session.upload_progress
+#                      (the advisory recommends keeping that off even after patching)
 #   --skip-migrate     don't touch packages (config mitigations only)
 #
 # Puppet is left DISABLED at the end on purpose. Update your Puppet code (no ondrej
@@ -307,17 +308,39 @@ fi
 
 # ================================================================ 3. Mitigations
 step "Step 3: FPM config mitigations"
-MARK='CVE-2026-109618/109619 mitigation'
-DROPIN_INI=$ETC_PHP/fpm/conf.d/99-cve-2026-109618-109619.ini
+FULL_MARK='CVE-2026-109618/109619 mitigation'
+UP_MARK='session upload progress off'
 SYSTEMD_DROPIN=/etc/systemd/system/$FPM_SVC.service.d/zz-cve-2026-109618.conf
-
-if (( ! DO_MITIGATE )); then
-  note "Skipped (--skip-mitigate)"
+if (( DO_MITIGATE )); then
+  MARK=$FULL_MARK
+  DROPIN_INI=$ETC_PHP/fpm/conf.d/99-cve-2026-109618-109619.ini
 else
+  # Even without the interim mitigations, session upload progress is turned off:
+  # it's one of the confirmed exploit paths, and the advisory recommends keeping
+  # it off after patching too.
+  MARK=$UP_MARK
+  DROPIN_INI=$ETC_PHP/fpm/conf.d/99-session-upload-progress-off.ini
+  note "--skip-mitigate: only turning off session.upload_progress (keep it off even after patching)"
+fi
+
+{
   shopt -s nullglob
   POOLS=("$POOL_DIR"/*.conf)
   shopt -u nullglob
   (( ${#POOLS[@]} )) || die "No pool files found in $POOL_DIR"
+
+  if (( ! DO_MITIGATE )); then
+  note "session.upload_progress.enabled  $(fpm_ini session.upload_progress.enabled) -> 0"
+  if (( MAXREQ1 )); then note "pm.max_requests                  -> 1 (every pool)"; fi
+  cat > "$WORKDIR/new/dropin.ini" <<EOF
+; $MARK, added by php-esm-migrate.sh on $TS (CVE-2026-109619).
+; Keep this even after patching, as the PHP advisory recommends.
+session.upload_progress.enabled = 0
+EOF
+  POOL_BLOCK="; >>> $MARK (php-esm-migrate.sh $TS)
+php_admin_flag[session.upload_progress.enabled] = off"
+  KEYS='session\.upload_progress\.enabled'
+  else
 
   # Work out targets: never raise an existing limit.
   mapfile -t PV < <(pool_vals post_max_size)
@@ -364,14 +387,15 @@ php_admin_value[post_max_size] = $TARGET_POST
 php_admin_value[upload_max_filesize] = $TARGET_UP
 php_admin_value[max_input_nesting_level] = $TARGET_NEST
 php_admin_flag[session.upload_progress.enabled] = off"
+  KEYS='memory_limit|post_max_size|upload_max_filesize|max_input_nesting_level|session\.upload_progress\.enabled'
+  fi
   if (( MAXREQ1 )); then POOL_BLOCK+=$'\npm.max_requests = 1'; fi
   POOL_BLOCK+=$'\n; <<< '"$MARK"
   export POOL_BLOCK
 
-  KEYS='memory_limit|post_max_size|upload_max_filesize|max_input_nesting_level|session\.upload_progress\.enabled'
   for f in "${POOLS[@]}"; do
     out="$WORKDIR/new/pool-$(basename "$f")"
-    if grep -qF "$MARK" "$f"; then
+    if grep -qF "$MARK" "$f" || { (( ! DO_MITIGATE )) && grep -qF "$FULL_MARK" "$f"; }; then
       note "$(basename "$f"): mitigation block already present, leaving as is"
       cp "$f" "$out"; continue
     fi
@@ -389,6 +413,7 @@ php_admin_flag[session.upload_progress.enabled] = off"
   done
 
   # systemd: replace PHP's per-request memory cap with a service-level one.
+  if (( DO_MITIGATE )); then
   if [[ -z $MEMCAP ]]; then
     MEMCAP="$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) * 3 / 4 / 1024 ))M"
   fi
@@ -404,6 +429,7 @@ LimitDATA=infinity
 Restart=on-failure
 EOF
   note "systemd MemoryLimit for $FPM_SVC: $MEMCAP"
+  fi
 
   PVAL=$(grep -rnsE 'PHP_(ADMIN_)?VALUE' /etc/nginx /etc/apache2 2>/dev/null || true)
   if [[ -z $PVAL ]]; then
@@ -414,13 +440,17 @@ EOF
   fi
 
   if (( APPLY )); then
+    SYSTEMD_HAD=0; [[ -e $SYSTEMD_DROPIN ]] && SYSTEMD_HAD=1
     install -m 0644 "$WORKDIR/new/dropin.ini" "$DROPIN_INI"
     for f in "${POOLS[@]}"; do cat "$WORKDIR/new/pool-$(basename "$f")" > "$f"; done
-    mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
-    install -m 0644 "$WORKDIR/new/systemd.conf" "$SYSTEMD_DROPIN"
+    if (( DO_MITIGATE )); then
+      mkdir -p "$(dirname "$SYSTEMD_DROPIN")"
+      install -m 0644 "$WORKDIR/new/systemd.conf" "$SYSTEMD_DROPIN"
+    fi
     if ! "$FPM_BIN" -t >"$WORKDIR/fpm-test.txt" 2>&1; then
       sed 's/^/      /' "$WORKDIR/fpm-test.txt"
-      rm -f "$DROPIN_INI" "$SYSTEMD_DROPIN"
+      rm -f "$DROPIN_INI"
+      if (( DO_MITIGATE && ! SYSTEMD_HAD )); then rm -f "$SYSTEMD_DROPIN"; fi
       tar -xzf "$WORKDIR/etc-php-$FPMV.tgz" -C /
       systemctl daemon-reload
       die "$FPM_BIN -t rejected the new config; original config restored."
@@ -428,11 +458,15 @@ EOF
     systemctl daemon-reload
     systemctl restart "$FPM_SVC"
     systemctl is-active --quiet "$FPM_SVC" || die "$FPM_SVC did not come back up (journalctl -u $FPM_SVC)."
-    ok "Mitigations in place, $FPM_SVC restarted"
+    ok "Config changes in place, $FPM_SVC restarted"
   else
-    note "(dry-run) would write $DROPIN_INI, the pool changes above, $SYSTEMD_DROPIN, then test and restart $FPM_SVC"
+    if (( DO_MITIGATE )); then
+      note "(dry-run) would write $DROPIN_INI, the pool changes above, $SYSTEMD_DROPIN, then test and restart $FPM_SVC"
+    else
+      note "(dry-run) would write $DROPIN_INI and the pool changes above, then test and restart $FPM_SVC"
+    fi
   fi
-fi
+}
 
 # ================================================================ 4. Migration
 step "Step 4: Move PHP $PHPV from the ondrej PPA to Ubuntu ESM packages"
@@ -586,6 +620,10 @@ if (( APPLY )); then
     note "Pool overrides:"
     "$FPM_BIN" -tt 2>&1 | grep -E 'php_admin_(value|flag)|pm\.max_requests' | sed -E 's/^.*NOTICE:[[:space:]]*/      /' || true
     note "systemd: $(systemctl show "$FPM_SVC" -p MemoryLimit -p LimitAS -p LimitDATA | tr '\n' ' ')"
+  else
+    UPV=$(fpm_ini session.upload_progress.enabled)
+    if [[ $UPV == Off || $UPV == 0 ]]; then ok "session.upload_progress.enabled = $UPV"
+    else warn "session.upload_progress.enabled is still '$UPV'"; fi
   fi
 else
   note "(dry-run) nothing to verify"
