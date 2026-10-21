@@ -35,10 +35,10 @@ LABEL1="PHP from Ubuntu packages"
 SURY=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 2>/dev/null \
          | awk '$1=="ii" && $2 ~ /^(php|libapache2-mod-php)/ && $3 ~ /sury/ {print $2}' | xargs)
 PPA=$(grep -lsE '^[[:space:]]*deb[^#]*ondrej/php' /etc/apt/sources.list /etc/apt/sources.list.d/*.list | xargs)
-FPM=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'php*-fpm' 2>/dev/null \
+FPM=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'php[0-9]*-fpm' 2>/dev/null \
         | awk '$1=="ii" {print $2, $3; exit}')
 if [[ -z $FPM ]]; then
-  FPM=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'php*-cli' 2>/dev/null \
+  FPM=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' 'php[0-9]*-cli' 2>/dev/null \
           | awk '$1=="ii" {print $2, $3; exit}')
 fi
 if [[ -z $FPM ]]; then
