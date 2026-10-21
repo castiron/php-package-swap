@@ -231,7 +231,15 @@ plan_packages() {
   fi
   while read -r r; do
     [[ -z $r ]] && continue
-    [[ " ${REMOVE[*]} " == *" $r "* ]] || problem "apt would also remove $r." "Check $WORKDIR/apt-simulation.txt and handle it manually."
+    [[ " ${REMOVE[*]} " == *" $r "* ]] && continue
+    # A PPA library with no Ubuntu version, replaced by Ubuntu's own soname
+    # (e.g. libpcre2-posix3 -> libpcre2-posix0): expected, as long as nothing
+    # outside the switch still needs it (apt would have refused otherwise).
+    if [[ " ${LEFTOVER[*]} " == *" $r "* ]]; then
+      if (( show )); then note "  $r: PPA library replaced by Ubuntu's version (expected)"; fi
+      continue
+    fi
+    problem "apt would also remove $r." "Check $WORKDIR/apt-simulation.txt and handle it manually."
   done < <(awk '/^Remv /{print $2}' <<<"$SIM")
 }
 
